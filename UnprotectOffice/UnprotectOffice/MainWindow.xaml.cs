@@ -8,6 +8,7 @@ using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Navigation;
 using Microsoft.Win32;
+using System.Xml
 
 namespace UnprotectOffice
 {
@@ -24,6 +25,8 @@ namespace UnprotectOffice
             Title += FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
         }
 
+        private string PickFolderPath = "";
+        
         /// <summary>
         ///     Open file picker and refresh label and button based on input
         /// </summary>
@@ -34,7 +37,7 @@ namespace UnprotectOffice
             var dialog = new OpenFileDialog
             {
                 Multiselect = true,
-                InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                InitialDirectory = Directory.Exists(PickFolderPath) ? PickFolderPath : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
                 Filter = "OOXML files|*.docx;*.docm;*.pptx;*.pptm;*.xlsx;*.xlsm"
             };
 
@@ -47,6 +50,7 @@ namespace UnprotectOffice
                 );
 
                 _files = dialog.FileNames;
+                PickFolderPath = Directory.GetParent(dialog.FileName).FullName;
             }
             else
             {
@@ -82,6 +86,7 @@ namespace UnprotectOffice
                 foreach (var file in _files)
                 {
                     var f = FileArray(file);
+                    string transSuffix = "";
 
                     ProgressText.Text = $"Extracting {f[1]}...";
                     var extractPath = ExtractFile(f);
@@ -89,18 +94,23 @@ namespace UnprotectOffice
                     ProgressText.Text = $"Unprotecting {f[1]}...";
                     Unprotect(extractPath, f[3]);
 
+                    if (MathtransCheck.IsChecked == true)
+                    {
+                        ProgressText.Text = $"Transforming {f[1]}...";
+                        TransMathFormulaToTxt(extractPath);
+                        transSuffix = "-transformed";
+                    }
+                    
                     ProgressText.Text = $"Compressing {f[1]}...";
                     var newFile = $"{extractPath}.{f[3]}";
                     ZipFile.CreateFromDirectory(extractPath, newFile);
 
                     ProgressText.Text = $"Saving {f[1]}...";
-                    var backupFile = BackupCheck.IsChecked == true
-                        ? $"{f[4]}{Path.DirectorySeparatorChar}{f[2]}-backup.{f[3]}"
-                        : $"{extractPath}.backup";
+                    var newFilePath = BackupCheck.IsChecked == true
+                        ? $"{f[4]}{Path.DirectorySeparatorChar}{f[2]}-unprotected{transSuffix}.{f[3]}"
+                        : f[0];
 
-                    File.Delete(backupFile);
-                    File.Move(f[0], backupFile);
-                    File.Move(newFile, f[0]);
+                    File.Copy(newFile, newFilePath, true);
 
                     Directory.Delete(new DirectoryInfo(extractPath).Parent.FullName, true);
                 }
@@ -113,7 +123,6 @@ namespace UnprotectOffice
                     MessageBoxButton.OK,
                     MessageBoxImage.Error
                 );
-                Application.Current.Shutdown();
             }
 
             ProgressText.Text = "Done.";
@@ -151,8 +160,30 @@ namespace UnprotectOffice
             switch (type)
             {
                 case 'd':
-                    RemoveFileTextRegex(Path.Combine(path, "word", "settings.xml"), "<w:documentProtection.*?/>");
-                    break;
+                    {
+                        for (int i = 0; i <= 5; i++)
+                        {
+                            try
+                            {
+                                if (i == 0)
+                                {
+                                    RemoveFileTextRegex(Path.Combine(path, "word", "settings.xml"), "<w:documentProtection.*?/>");
+                                }
+                                else
+                                {
+                                    RemoveFileTextRegex(Path.Combine(path, "word", "settings" + i.ToString() + ".xml"), "<w:documentProtection.*?/>");
+                                }
+                            }
+                            catch (FileNotFoundException)
+                            {
+                            }
+                            catch (Exception)
+                            {
+                                throw;
+                            }
+                        }
+                        break;
+                    }
             }
         }
 
@@ -167,6 +198,64 @@ namespace UnprotectOffice
             fileText = Regex.Replace(fileText, pattern, string.Empty);
             File.WriteAllText(file, fileText);
         }
+
+        
+        private static void TransMathFormulaToTxt(string path)
+        {
+            string file = Path.Combine(path, "word", "document.xml");
+
+            string wordURI = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+            string mathURI = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+            // Read the document
+            XmlDocument xmlDoc = new XmlDocument();
+            xmlDoc.Load(file);
+            // Add a namespace
+            var xmlNsm = new XmlNamespaceManager(xmlDoc.NameTable);
+            xmlNsm.AddNamespace("w", wordURI);
+            xmlNsm.AddNamespace("m", mathURI);
+            // Read the root node
+            XmlNode xmlNode = xmlDoc.SelectSingleNode("/w:document", xmlNsm);
+            // Convert formulas to text
+            xmlDoc = transOmathToTxt(xmlDoc, xmlNode, wordURI);
+            // Write the result to an XML file without line breaking
+            // using (XmlTextWriter xmlTw = new XmlTextWriter(file, System.Text.Encoding.UTF8))
+            // {
+            //    xmlTw.Formatting = Formatting.None;
+            //    xmlDoc.Save(xmlTw);
+            // }
+            // Write the result to an XML file in a newline fashion
+            xmlDoc.Save(file);
+        }
+
+        /// <summary>
+        /// Recursively replace formulas in Word with text
+        /// </summary>
+        /// <param name="xmlDoc"></param>
+        /// <param name="xmlNode"></param>
+        /// <param name="wordURI"></param>
+        /// <returns></returns>
+        private static XmlDocument transOmathToTxt(XmlDocument xmlDoc, XmlNode xmlNode, string wordURI)
+        {
+            if (xmlNode.HasChildNodes)
+            {
+                for (int nodeNum=0; nodeNum< xmlNode.ChildNodes.Count; nodeNum++)
+                {
+                    if ((xmlNode.ChildNodes[nodeNum].Name == "m:oMathPara") || (xmlNode.ChildNodes[nodeNum].Name == "m:oMath"))
+                    {
+                        XmlNode newNode = xmlDoc.CreateNode(XmlNodeType.Element, "w:r", wordURI);
+                        newNode.AppendChild(xmlDoc.CreateNode(XmlNodeType.Element, "w:t", wordURI));
+                        newNode.FirstChild.InnerText = xmlNode.ChildNodes[nodeNum].InnerText;
+                        xmlNode.ReplaceChild(newNode, xmlNode.ChildNodes[nodeNum]);
+                    }
+                    else
+                    {
+                        xmlDoc = transOmathToTxt(xmlDoc, xmlNode.ChildNodes[nodeNum], wordURI);
+                    }
+                }
+            }
+            return xmlDoc;
+        }
+
 
         /// <summary>
         ///     Create a file information array
